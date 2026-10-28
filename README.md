@@ -14,7 +14,7 @@ Get the compiled `version.dll` from the [latest release](../../releases/latest).
 2. Create a `Mods` folder there and drop mod DLLs in it.
 3. Start the game and press **F10**.
 
-## What the loader does (1.3.0)
+## What the loader does (1.4.0)
 - **SDK mods**: `Mods\*.dll` built with the SDK (they export `MewMod_Init`), with the F10 menu (enable/disable, settings) and `Mods\config\core.cfg`.
 - **Community mods**: mods written for [Mewjector](https://github.com/githubuser508/mewjector) run unchanged. The loader exposes Mewjector's API v3
   (`MJ_InstallHook`, `MJ_QueryHook`, `MJ_AllocTypeIdPair`, `MJ_RegisterName`, `MJ_LookupName`, `MJ_GetGameBase`, `MJ_Log`, `MJ_VerifyHooks`,
@@ -47,3 +47,5 @@ Needs Visual Studio 2022 (MSVC, x64).
 - `core/mj.c`: Mewjector API v3, hook chain, chainloader.ini and Mewtator manifest.
 - `core/minhook/`: [MinHook](https://github.com/TsudaKageyu/minhook) (BSD-2-Clause, see its `LICENSE.txt`).
 - `agent/agent.c`: in-process helper compiled into the loader.
+
+- **Furniture, built in**: a mod can add furniture with a picture and a small text file. The loader merges `data\furniture_info.data.append` (rows captured with the game's furniture editor) and compiles `furniture\<Name>.txt` (the shape drawn as text: `#` solid, `B` surface, `R` support, `Y` clickable, `P` poop, 24x24 grid centred on the piece). MewFurnitureFramework is not needed; mods made with it keep working. Furniture of removed mods is shown as "Removed furniture" so old saves keep loading, without editing them.

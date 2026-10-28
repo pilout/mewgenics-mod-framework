@@ -6,8 +6,8 @@
 #include "../agent/agent.c"
 #include "minhook/include/MinHook.h"
 
-#define CORE_VERSION "1.3.0"
-#define CORE_VERSION_W L"1.3.0"
+#define CORE_VERSION "1.4.0"
+#define CORE_VERSION_W L"1.4.0"
 #define GAME_PE_TIMESTAMP 0x6A9C51E5u
 
 // ---- RVAs (keep in sync with MewgenicsModSdk.Game/GameAddressMap.cs) ----
@@ -340,7 +340,7 @@ static void install_core_hooks(void) {
 }
 
 // ---- config (Mods\config\core.cfg: agent=1, disabled=id1,id2) ----
-static char g_cfg_disabled[2048]; static int g_cfg_agent; static int g_cfg_resources = 1; static int g_cfg_entry = 0; static char g_cfg_menu_key[32] = "F10";
+static char g_cfg_disabled[2048]; static int g_cfg_agent; static int g_cfg_resources = 1; static int g_cfg_furniture = 1; static int g_cfg_entry = 0; static char g_cfg_menu_key[32] = "F10";
 static void load_cfg(void) {
     char p[MAX_PATH]; snprintf(p, sizeof p, "%s\\Mods\\config\\core.cfg", g_dir);
     FILE *f = fopen(p, "r"); if (!f) return;
@@ -349,6 +349,7 @@ static void load_cfg(void) {
         char *e = strchr(line, '='); if (!e) continue; *e++ = 0; e[strcspn(e, "\r\n")] = 0;
         if (!_stricmp(line, "agent")) g_cfg_agent = atoi(e) || !_stricmp(e, "true");
         else if (!_stricmp(line, "resources")) g_cfg_resources = atoi(e) || !_stricmp(e, "true");
+        else if (!_stricmp(line, "furniture")) g_cfg_furniture = atoi(e) || !_stricmp(e, "true");
         else if (!_stricmp(line, "early_entry")) g_cfg_entry = atoi(e) || !_stricmp(e, "true");
         else if (!_stricmp(line, "menu_key")) strncpy(g_cfg_menu_key, e, sizeof g_cfg_menu_key - 1);
         else if (!_stricmp(line, "disabled")) strncpy(g_cfg_disabled, e, sizeof g_cfg_disabled - 1);
@@ -367,6 +368,7 @@ static int is_disabled(const char *id) {
 // files are merged natively. The hook runs inside ApplicationBase::ProcessCmds, before the game reads any data.
 // sprites\<Clip>\<Label>.png are compiled into a SWF first (assets.c) and the generated cache folder is added as well.
 #include "assets.c"
+#include "furniture.c"
 #define RVA_PROCESS_CMDS 0x9B8BB0
 #define MAX_RES_DIRS 64
 typedef void (__fastcall *ProcessCmdsFn)(void *app, int argc, char **argv);
@@ -397,6 +399,7 @@ static void collect_resource_dirs(void) {
     free(es);
     char cache[MAX_PATH]; snprintf(cache, sizeof cache, "%s\\.cache\\_items", root);
     if (assets_items(root, names, nn, cache) && g_nresdirs < MAX_RES_DIRS) strcpy(g_resdirs[g_nresdirs++], cache);
+    if (g_cfg_furniture) { snprintf(cache, sizeof cache, "%s\\.cache\\_furniture", root); if (furn_ghosts(cache) && g_nresdirs < MAX_RES_DIRS) strcpy(g_resdirs[g_nresdirs++], cache); }
     for (int i = 0; i < nn; i++) {
         char dir[MAX_PATH]; snprintf(dir, sizeof dir, "%s\\%s", root, names[i]);
         int plain = has_subdir(dir, "data") || has_subdir(dir, "swfs") || has_subdir(dir, "textures"), sprites = has_subdir(dir, "sprites");
@@ -432,8 +435,8 @@ static void *__fastcall h_trace(void *ctx, void *path, uint8_t uc, uint8_t af) {
     return o_trace(ctx, path, uc, af);
 }
 static void trace_loads(void) { void *next = chain_install(0x99FF50, h_trace, 100, "trace"); if (next) { o_trace = (LoadFn)next; clog("[Trace] packed-file load trace on"); } }
-// Process entry point: the earliest point where code can run synchronously without the loader lock. Community (Mewjector-style) mods are loaded
-// here because the game reads some of its data (furniture_info.data) before it parses its command line.
+// Process entry point hook (early_entry=1 only, it crashes the game). Community (Mewjector-style) mods are loaded from ProcessCmds instead:
+// measured with MEW_TRACE_LOAD, the only file the game reads before it is resource_location.txt, so no game data is missed.
 typedef int (__fastcall *EntryFn)(void *);
 static EntryFn o_entry;
 static void early_community(void) {
@@ -443,8 +446,10 @@ static void early_community(void) {
 }
 static int __fastcall h_entry(void *peb) { clog("[ModLoader] entry point reached (thread %lu)", GetCurrentThreadId()); early_community(); clog("[ModLoader] early phase done"); return o_entry(peb); }
 static void __fastcall h_process_cmds(void *app, int argc, char **argv) {
+    clog("[Resources] ProcessCmds reached (thread %lu, %ld packed-file loads before)", GetCurrentThreadId(), (long)g_ntrace);
     __try {
         early_community();
+        furn_note_modpaths(argc, argv);
         g_nresdirs = 0; if (g_cfg_resources) collect_resource_dirs();
         int mp = -1;
         for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "-modpaths")) { mp = i; break; }
@@ -497,6 +502,7 @@ static void early_init(void) {
     o_process_cmds = (ProcessCmdsFn)tramp;
     clog("[Resources] ProcessCmds hook ready");
     if (getenv("MEW_TRACE_LOAD")) trace_loads();
+    furn_install();
     void *entry = (void *)(g_base + nt->OptionalHeader.AddressOfEntryPoint), *etramp = NULL;
     st = g_cfg_entry ? MH_CreateHook(entry, h_entry, &etramp) : MH_ERROR_DISABLED; if (st == MH_OK) st = MH_EnableHook(entry);
     if (st == MH_OK) { o_entry = (EntryFn)etramp; clog("[ModLoader] entry point hook ready (entry RVA 0x%X, thread %lu)", (unsigned)nt->OptionalHeader.AddressOfEntryPoint, GetCurrentThreadId()); }
