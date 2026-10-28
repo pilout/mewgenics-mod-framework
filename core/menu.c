@@ -12,8 +12,10 @@
 
 #define WM_MENU_SHOW    (WM_APP + 1)   // wParam: 0 hide, 1 show+activate, 2 show without activating, 3 toggle+activate
 #define WM_MENU_REFRESH (WM_APP + 2)
-enum { IDC_LIST = 100, IDC_DESC, IDC_OPENCFG, IDC_RELOAD, IDC_CLOSE, IDC_HINT, IDC_ROW0 = 200 };   // rows use IDC_ROW0 + 2*i (label) and + 2*i+1 (input)
-#define MENU_MAX_ROWS 8
+enum { IDC_LIST = 100, IDC_DESC, IDC_OPENCFG, IDC_RELOAD, IDC_CLOSE, IDC_HINT, IDC_SCROLL, IDC_ROW0 = 200 };   // rows use IDC_ROW0 + 2*i (label) and + 2*i+1 (input)
+#define MENU_MAX_ROWS 64   // settings of one mod that can be listed; MENU_VIS_ROWS show at once, the rest scrolls
+#define MENU_VIS_ROWS 8
+#define MENU_MAX_KV 256
 #define MENU_ROWS_Y 226
 
 static HWND g_menu, g_menuList, g_menuDesc;
@@ -100,6 +102,7 @@ enum { K_EDIT, K_BOOL, K_COMBO, K_ACTION };
 typedef struct { char key[64]; char val[256]; int kind; HWND lbl, ctl; CfgOpt *opt; int nopt; int editable; } CfgRow;
 static CfgRow g_rows[MENU_MAX_ROWS]; static int g_nrows, g_rowsMod = -1;
 static wchar_t g_menuHint[200];
+static HWND g_scroll; static int g_rowOff;
 
 static int cfg_load(int mi, CfgKV *kv, int cap) {
     char p[MAX_PATH], line[512]; int n = 0;
@@ -144,7 +147,7 @@ static int row_has_focus(const CfgRow *r) { HWND f = GetFocus(); return f && (f 
 
 static void menu_rows_clear(void) {
     for (int i = 0; i < g_nrows; i++) { if (g_rows[i].lbl) DestroyWindow(g_rows[i].lbl); if (g_rows[i].ctl) DestroyWindow(g_rows[i].ctl); free(g_rows[i].opt); g_rows[i].opt = NULL; }
-    g_nrows = 0; g_rowsMod = -1;
+    g_nrows = 0; g_rowsMod = -1; g_rowOff = 0;
 }
 
 static void row_set_value_ui(CfgRow *r, const char *val) {
@@ -158,9 +161,27 @@ static void row_set_value_ui(CfgRow *r, const char *val) {
     else if (r->kind == K_EDIT) SetWindowTextW(r->ctl, w);
 }
 
+// Shows the rows from g_rowOff on (MENU_VIS_ROWS of them) and hides the others; the scroll bar follows.
+static void menu_rows_layout(void) {
+    int maxoff = g_nrows > MENU_VIS_ROWS ? g_nrows - MENU_VIS_ROWS : 0;
+    if (g_rowOff > maxoff) g_rowOff = maxoff; if (g_rowOff < 0) g_rowOff = 0;
+    for (int i = 0; i < g_nrows; i++) {
+        CfgRow *r = &g_rows[i]; int vis = i >= g_rowOff && i < g_rowOff + MENU_VIS_ROWS, y = MENU_ROWS_Y + (i - g_rowOff) * 28;
+        HWND w[2] = { r->lbl, r->ctl };
+        for (int k = 0; k < 2; k++) if (w[k]) {
+            int x = (k == 0 || r->kind == K_BOOL) ? 10 : 270;
+            if (vis) SetWindowPos(w[k], NULL, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            ShowWindow(w[k], vis ? SW_SHOWNA : SW_HIDE);
+        }
+    }
+    if (g_scroll) {
+        SCROLLINFO si = { sizeof si, SIF_RANGE | SIF_PAGE | SIF_POS, 0, g_nrows > 0 ? g_nrows - 1 : 0, MENU_VIS_ROWS, g_rowOff, 0 };
+        SetScrollInfo(g_scroll, SB_CTL, &si, TRUE); ShowWindow(g_scroll, g_nrows > MENU_VIS_ROWS ? SW_SHOWNA : SW_HIDE);
+    }
+}
 // Builds the inputs for mod mi, or only refreshes their values when the same keys are already shown.
 static void menu_rows_build(int mi) {
-    CfgKV kv[64]; int n = (mi >= 0 && mi < g_nmods) ? cfg_load(mi, kv, 64) : 0;
+    CfgKV kv[MENU_MAX_KV]; int n = (mi >= 0 && mi < g_nmods) ? cfg_load(mi, kv, MENU_MAX_KV) : 0;
     CfgKV shown[MENU_MAX_ROWS]; int ns = 0;
     for (int i = 0; i < n && ns < MENU_MAX_ROWS; i++) if (!key_is_meta(kv[i].key)) shown[ns++] = kv[i];
     const char *st = kv_find(kv, n, "__status");
@@ -182,26 +203,27 @@ static void menu_rows_build(int mi) {
         r->opt = act ? NULL : opts_load(mi, r->key, &r->nopt);
         r->kind = act ? K_ACTION : r->opt ? K_COMBO : is_boolstr(r->val) ? K_BOOL : K_EDIT;
         wchar_t wl[200]; utf8_to_w(hint ? hint : r->key, wl, 200);
-        int y = MENU_ROWS_Y + i * 28, id = IDC_ROW0 + 2 * i;
+        int y = MENU_ROWS_Y + (i < MENU_VIS_ROWS ? i : 0) * 28, id = IDC_ROW0 + 2 * i;
         if (r->kind == K_ACTION) {
             wchar_t wa[200]; utf8_to_w(act, wa, 200);
-            r->ctl = menu_child(L"BUTTON", wa, WS_TABSTOP | BS_PUSHBUTTON, 270, y, 260, 24, id + 1);
+            r->ctl = menu_child(L"BUTTON", wa, WS_TABSTOP | BS_PUSHBUTTON, 270, y, 240, 24, id + 1);
         } else if (r->kind == K_BOOL) {
-            r->ctl = menu_child(L"BUTTON", wl, WS_TABSTOP | BS_AUTOCHECKBOX, 10, y, 520, 22, id + 1);
+            r->ctl = menu_child(L"BUTTON", wl, WS_TABSTOP | BS_AUTOCHECKBOX, 10, y, 500, 22, id + 1);
             row_set_value_ui(r, r->val);
         } else if (r->kind == K_COMBO) {
             r->editable = r->nopt > 12;
             r->lbl = menu_child(L"STATIC", wl, SS_LEFT | SS_CENTERIMAGE, 10, y, 250, 22, id);
-            r->ctl = menu_child(L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | (r->editable ? CBS_DROPDOWN | CBS_AUTOHSCROLL : CBS_DROPDOWNLIST), 270, y, 260, 260, id + 1);
+            r->ctl = menu_child(L"COMBOBOX", L"", WS_TABSTOP | WS_VSCROLL | (r->editable ? CBS_DROPDOWN | CBS_AUTOHSCROLL : CBS_DROPDOWNLIST), 270, y, 240, 260, id + 1);
             for (int k = 0; k < r->nopt; k++) SendMessageW(r->ctl, CB_ADDSTRING, 0, (LPARAM)r->opt[k].disp);
             row_set_value_ui(r, r->val);
         } else {
             r->lbl = menu_child(L"STATIC", wl, SS_LEFT | SS_CENTERIMAGE, 10, y, 250, 22, id);
-            r->ctl = menu_child(L"EDIT", L"", WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 270, y, 260, 22, id + 1);
+            r->ctl = menu_child(L"EDIT", L"", WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL, 270, y, 240, 22, id + 1);
             row_set_value_ui(r, r->val);
         }
         g_nrows++;
     }
+    menu_rows_layout();
 }
 
 // Typing in a long drop-down: keep only the choices containing the typed text.
@@ -246,9 +268,9 @@ static void menu_row_apply(int row) {
     }
     if (r->kind == K_COMBO) row_set_value_ui(r, nv);
     if (!strcmp(nv, r->val)) return;
-    CfgKV kv[64]; int n = cfg_load(g_rowsMod, kv, 64), found = 0;
+    CfgKV kv[MENU_MAX_KV]; int n = cfg_load(g_rowsMod, kv, MENU_MAX_KV), found = 0;
     for (int i = 0; i < n; i++) if (!strcmp(kv[i].key, r->key)) { strcpy(kv[i].val, nv); found = 1; }
-    if (!found && n < 64) { strcpy(kv[n].key, r->key); strcpy(kv[n].val, nv); n++; }
+    if (!found && n < MENU_MAX_KV) { strcpy(kv[n].key, r->key); strcpy(kv[n].val, nv); n++; }
     cfg_store(g_rowsMod, kv, n); strcpy(r->val, nv);
     menu_queue(g_rowsMod, 2);
 }
@@ -315,6 +337,20 @@ static LRESULT CALLBACK menu_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
         }
         return 0;
+    case WM_VSCROLL:
+        if ((HWND)lp == g_scroll) {
+            SCROLLINFO si = { sizeof si, SIF_ALL }; GetScrollInfo(g_scroll, SB_CTL, &si); int pos = si.nPos;
+            switch (LOWORD(wp)) {
+            case SB_LINEUP: pos--; break; case SB_LINEDOWN: pos++; break;
+            case SB_PAGEUP: pos -= MENU_VIS_ROWS; break; case SB_PAGEDOWN: pos += MENU_VIS_ROWS; break;
+            case SB_THUMBTRACK: case SB_THUMBPOSITION: pos = si.nTrackPos; break;
+            }
+            g_rowOff = pos; menu_rows_layout();
+        }
+        return 0;
+    case WM_MOUSEWHEEL:
+        if (g_nrows > MENU_VIS_ROWS) { g_rowOff -= GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA * 2; menu_rows_layout(); }
+        return 0;
     case WM_CLOSE: ShowWindow(h, SW_HIDE); return 0;
     }
     return DefWindowProcW(h, msg, wp, lp);
@@ -342,6 +378,7 @@ static DWORD WINAPI menu_thread(LPVOID p) {
     col.pszText = L"Version"; col.cx = 80; SendMessageW(g_menuList, LVM_INSERTCOLUMNW, 1, (LPARAM)&col);
     col.pszText = L"Id"; col.cx = 175; SendMessageW(g_menuList, LVM_INSERTCOLUMNW, 2, (LPARAM)&col);
     g_menuDesc = menu_child(L"STATIC", L"", SS_LEFT, 10, 166, 520, 54, IDC_DESC);
+    g_scroll = CreateWindowExW(0, L"SCROLLBAR", L"", WS_CHILD | SBS_VERT, 514, MENU_ROWS_Y, 18, MENU_VIS_ROWS * 28 - 4, g_menu, (HMENU)(intptr_t)IDC_SCROLL, g_self, NULL);
     menu_child(L"BUTTON", L"Open config", WS_TABSTOP | BS_PUSHBUTTON, 10, 458, 110, 26, IDC_OPENCFG);
     menu_child(L"BUTTON", L"Reload config", WS_TABSTOP | BS_PUSHBUTTON, 128, 458, 110, 26, IDC_RELOAD);
     menu_child(L"BUTTON", L"Close", WS_TABSTOP | BS_PUSHBUTTON, 420, 458, 110, 26, IDC_CLOSE);

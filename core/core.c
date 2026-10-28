@@ -6,8 +6,8 @@
 #include "../agent/agent.c"
 #include "minhook/include/MinHook.h"
 
-#define CORE_VERSION "1.2.0"
-#define CORE_VERSION_W L"1.2.0"
+#define CORE_VERSION "1.3.0"
+#define CORE_VERSION_W L"1.3.0"
 #define GAME_PE_TIMESTAMP 0x6A9C51E5u
 
 // ---- RVAs (keep in sync with MewgenicsModSdk.Game/GameAddressMap.cs) ----
@@ -18,7 +18,7 @@ enum {
     RVA_PURCHASE_ITEM = 0x79A600, RVA_ITEM_TOOLTIP = 0x7B5480, RVA_CAN_ADVANCE = 0x8F2070, RVA_LEVEL_START = 0x35BB80,
     RVA_LEVEL_UPDATE = 0x3611E0, RVA_TRANSITION = 0x3C0210, RVA_START_CHAPTER = 0x3B0D20, RVA_LEVELUP_REROLL = 0x383FE0, RVA_GET_ANIM_CTRL = 0x122D70, RVA_CATDB_FIND = 0xD7220,
     RVA_ATTACH_PASSIVE = 0x494080, RVA_CHARACTER_DIE = 0x115070, RVA_WARNING_BOX = 0x9522C0, RVA_APPLY_STATUS = 0x483120, RVA_STRING_ASSIGN = 0x520D0, RVA_STRING_FREE = 0x52780,
-    RVA_SDL_GL_SWAPWINDOW = 0xBA5550,
+    RVA_SDL_GL_SWAPWINDOW = 0xBA5550, RVA_NIGHT = 0x1E8B40,
     RVA_WORLD_PTR = 0x13DAC30, RVA_INVENTORY_GLOBAL = 0x13C7560,
 };
 enum { DMG_ATTACKER = 0x98, OFF_CATDB = 1432, CHAR_HP = 1200, CHAR_MAX_HP = 1212, CHAR_RECOMPUTE_DEPTH = 3764, TC_SPEED = 376, ANIM_SPEED = 80, INV_COINS = 328 };
@@ -27,7 +27,7 @@ enum { DMG_ATTACKER = 0x98, OFF_CATDB = 1432, CHAR_HP = 1200, CHAR_MAX_HP = 1212
 enum { EV_ITEM_PURCHASED = 1, EV_TOOLTIP, EV_DAY_ADVANCED, EV_DIALOG_CAN_ADVANCE, EV_SHOP_REROLLED, EV_HOUSE_UPDATE, EV_TURN_START,
        EV_COMBAT_FRAME, EV_CAT_DAMAGED, EV_STAT_RECOMPUTE, EV_ITEM_BREAK, EV_CLASS_LOCKED, EV_BRAIN_FACTORY, EV_STEVEN_SPAWN,
        EV_STEVEN_QUIT, EV_CAT_REMOVED, EV_FIGHT_START, EV_FIGHT_END, EV_ADVENTURE_START, EV_ADVENTURE_RETURN, EV_HOUSE_BOSS_INTRO,
-       EV_RUN_COIN_CHANGED, EV_ATTACH_PASSIVE, EV_CHARACTER_DIED, EV_STATUS_APPLY, EV_COUNT };
+       EV_RUN_COIN_CHANGED, EV_ATTACH_PASSIVE, EV_CHARACTER_DIED, EV_STATUS_APPLY, EV_DAY_ENDING, EV_NIGHT_PROCESSED, EV_COUNT };
 
 // ---- event args (layouts must match MewgenicsModSdk.Api.*EventArgs) ----
 typedef struct { intptr_t A1, A2, A3, A4, Result; } ItemPurchasedArgs;
@@ -85,8 +85,9 @@ static Mod g_mods[MAX_MODS]; static int g_nmods;
 static MewgenicsApi g_api;
 static intptr_t g_turnControl;
 static FILE *g_corelog;
+static CRITICAL_SECTION g_loadcs; static HANDLE g_early_evt; static volatile LONG g_early_done;   // early community-mod phase (see load_phases)
+static void load_phases(int early);
 static char g_dir[MAX_PATH];
-static struct { void *rvaTarget; void *tramp; } g_hooks[256]; static int g_nhooks;
 
 static void clog(const char *fmt, ...) {
     char buf[2048]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof buf, fmt, ap); va_end(ap);
@@ -95,21 +96,12 @@ static void clog(const char *fmt, ...) {
 }
 
 // ---- API implementation ----
+static int write_file(const char *path, const void *d, size_t n);   // assets.c
+#include "mj.c"
 static void api_log(const char *s) { clog("%s", s ? s : ""); }
-static void *api_hook(uint64_t rva, void *fn) {
-    void *target = (void *)(g_base + rva), *tramp = NULL;
-    MH_STATUS st = MH_CreateHook(target, fn, &tramp);
-    if (st == MH_OK) st = MH_EnableHook(target);
-    if (st != MH_OK) { clog("[Hook] RVA 0x%llX failed: %s", (unsigned long long)rva, MH_StatusToString(st)); return NULL; }
-    EnterCriticalSection(&g_cs); if (g_nhooks < 256) { g_hooks[g_nhooks].rvaTarget = target; g_hooks[g_nhooks].tramp = tramp; g_nhooks++; } LeaveCriticalSection(&g_cs);
-    return tramp;
-}
-static void api_unhook(void *tramp) {
-    EnterCriticalSection(&g_cs);
-    for (int i = 0; i < g_nhooks; i++) if (g_hooks[i].tramp == tramp) { MH_DisableHook(g_hooks[i].rvaTarget); MH_RemoveHook(g_hooks[i].rvaTarget); g_hooks[i] = g_hooks[--g_nhooks]; break; }
-    LeaveCriticalSection(&g_cs);
-}
-static void api_subscribe(int ev, void *cb) {
+// Hooks of the core (priority 30) and of SDK mods (40) share the Mewjector-style chain, so they can coexist with other loaders' mods.
+static void *api_hook(uint64_t rva, void *fn) { return chain_install(rva, fn, 30, "MewCore"); }
+static void api_unhook(void *tramp) { chain_remove(tramp); }static void api_subscribe(int ev, void *cb) {
     if (ev <= 0 || ev >= EV_COUNT || !cb) return;
     EnterCriticalSection(&g_cs);
     int dup = 0; for (int i = 0; i < MAX_SUBS; i++) if (g_subs[ev][i] == cb) dup = 1;
@@ -155,6 +147,7 @@ typedef uint64_t (*f2)(uint64_t, uint64_t);
 typedef uint64_t (*f3)(uint64_t, uint64_t, uint64_t);
 typedef uint64_t (*f4)(uint64_t, uint64_t, uint64_t, uint64_t);
 typedef uint64_t (*f3d)(uint64_t, uint64_t, uint64_t, double);
+static f2 o_night;
 static f1 o_house_update, o_pass_day, o_turn_start, o_tc_update, o_remove_cat, o_load_locked, o_level_start, o_reroll;
 static f2 o_damage, o_savescum, o_purchase, o_can_advance;
 static f3 o_stat, o_break, o_brain, o_quit, o_tooltip, o_level_update;
@@ -179,6 +172,15 @@ static void fire_adventure_start(void) { if (InterlockedExchange(&g_advFired, 1)
 static uint64_t h_start_chapter(uint64_t md, uint64_t map) { fire_adventure_start(); return o_start_chapter(md, map); }
 static uint64_t h_pass_day(uint64_t cap) {
     uint64_t r = o_pass_day(cap); HousePtrArgs a = { 0 }; safe_read(cap, &a.HousePtr, 8); fire(EV_DAY_ADVANCED, &a); return r;
+}
+// The night itself (pairing, births, ageing, fights). The game saves right after it returns, so mods that prepare the night
+// get EV_DAY_ENDING before and EV_NIGHT_PROCESSED after, and can undo their changes before the save.
+static uint64_t h_night(uint64_t house, uint64_t a2) {
+    HousePtrArgs a = { (intptr_t)house };
+    if (has_subs(EV_DAY_ENDING)) fire(EV_DAY_ENDING, &a);
+    uint64_t r = o_night(house, a2);
+    if (has_subs(EV_NIGHT_PROCESSED)) fire(EV_NIGHT_PROCESSED, &a);
+    return r;
 }
 static uint64_t h_turn_start(uint64_t tc) { g_turnControl = (intptr_t)tc; TurnStartArgs a = { (intptr_t)tc }; fire(EV_TURN_START, &a); return o_turn_start(tc); }
 static uint64_t h_tc_update(uint64_t tc) {
@@ -308,6 +310,7 @@ static uint64_t h_reroll(uint64_t screen) {
 static void install_core_hooks(void) {
     HOOK(RVA_HOUSE_UPDATE, h_house_update, o_house_update);
     HOOK(RVA_PASS_DAY, h_pass_day, o_pass_day);
+    HOOK(RVA_NIGHT, h_night, o_night);
     HOOK(RVA_TURN_START, h_turn_start, o_turn_start);
     HOOK(RVA_TURN_CONTROL_UPDATE, h_tc_update, o_tc_update);
     HOOK(RVA_APPLY_DAMAGE, h_damage, o_damage);
@@ -337,7 +340,7 @@ static void install_core_hooks(void) {
 }
 
 // ---- config (Mods\config\core.cfg: agent=1, disabled=id1,id2) ----
-static char g_cfg_disabled[2048]; static int g_cfg_agent; static char g_cfg_menu_key[32] = "F10";
+static char g_cfg_disabled[2048]; static int g_cfg_agent; static int g_cfg_resources = 1; static int g_cfg_entry = 0; static char g_cfg_menu_key[32] = "F10";
 static void load_cfg(void) {
     char p[MAX_PATH]; snprintf(p, sizeof p, "%s\\Mods\\config\\core.cfg", g_dir);
     FILE *f = fopen(p, "r"); if (!f) return;
@@ -345,6 +348,8 @@ static void load_cfg(void) {
     while (fgets(line, sizeof line, f)) {
         char *e = strchr(line, '='); if (!e) continue; *e++ = 0; e[strcspn(e, "\r\n")] = 0;
         if (!_stricmp(line, "agent")) g_cfg_agent = atoi(e) || !_stricmp(e, "true");
+        else if (!_stricmp(line, "resources")) g_cfg_resources = atoi(e) || !_stricmp(e, "true");
+        else if (!_stricmp(line, "early_entry")) g_cfg_entry = atoi(e) || !_stricmp(e, "true");
         else if (!_stricmp(line, "menu_key")) strncpy(g_cfg_menu_key, e, sizeof g_cfg_menu_key - 1);
         else if (!_stricmp(line, "disabled")) strncpy(g_cfg_disabled, e, sizeof g_cfg_disabled - 1);
     }
@@ -356,6 +361,148 @@ static int is_disabled(const char *id) {
     return 0;
 }
 
+// ---- resource folders ----
+// A folder Mods\<id>\ that holds data\, swfs\, textures\ or sprites\ is handed to the game's own mod overlay (-modpaths), the
+// same mechanism Mewtator uses: files are looked up there before resources.gpak and *.append / *.patch / *.merge
+// files are merged natively. The hook runs inside ApplicationBase::ProcessCmds, before the game reads any data.
+// sprites\<Clip>\<Label>.png are compiled into a SWF first (assets.c) and the generated cache folder is added as well.
+#include "assets.c"
+#define RVA_PROCESS_CMDS 0x9B8BB0
+#define MAX_RES_DIRS 64
+typedef void (__fastcall *ProcessCmdsFn)(void *app, int argc, char **argv);
+static ProcessCmdsFn o_process_cmds;
+static char g_resdirs[MAX_RES_DIRS][MAX_PATH]; static int g_nresdirs;
+
+static int has_subdir(const char *base, const char *sub) {
+    char p[MAX_PATH]; snprintf(p, sizeof p, "%s\\%s", base, sub);
+    DWORD a = GetFileAttributesA(p); return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+static int same_path(const char *a, const char *b) {
+    size_t la = strlen(a), lb = strlen(b);
+    while (la && (a[la - 1] == '\\' || a[la - 1] == '/')) la--;
+    while (lb && (b[lb - 1] == '\\' || b[lb - 1] == '/')) lb--;
+    if (la != lb) return 0;
+    for (size_t i = 0; i < la; i++) { char x = a[i] == '/' ? '\\' : a[i], y = b[i] == '/' ? '\\' : b[i]; if (tolower((unsigned char)x) != tolower((unsigned char)y)) return 0; }
+    return 1;
+}
+static void collect_resource_dirs(void) {
+    char root[MAX_PATH]; snprintf(root, sizeof root, "%s\\Mods", g_dir);
+    DirEnt *es; int ne = list_dir(root, 1, &es);
+    static char names[MAX_RES_DIRS][MAX_PATH]; int nn = 0;
+    for (int i = 0; i < ne && nn < MAX_RES_DIRS; i++) {
+        if (!_stricmp(es[i].name, "config")) continue;
+        if (is_disabled(es[i].name)) { clog("[Resources] %s is disabled, skipped", es[i].name); continue; }
+        strcpy(names[nn++], es[i].name);
+    }
+    free(es);
+    char cache[MAX_PATH]; snprintf(cache, sizeof cache, "%s\\.cache\\_items", root);
+    if (assets_items(root, names, nn, cache) && g_nresdirs < MAX_RES_DIRS) strcpy(g_resdirs[g_nresdirs++], cache);
+    for (int i = 0; i < nn; i++) {
+        char dir[MAX_PATH]; snprintf(dir, sizeof dir, "%s\\%s", root, names[i]);
+        int plain = has_subdir(dir, "data") || has_subdir(dir, "swfs") || has_subdir(dir, "textures"), sprites = has_subdir(dir, "sprites");
+        if (!plain && !sprites) continue;
+        if (plain && g_nresdirs < MAX_RES_DIRS) strcpy(g_resdirs[g_nresdirs++], dir);
+        snprintf(cache, sizeof cache, "%s\\.cache\\%s", root, names[i]);
+        if (assets_mod(dir, names[i], cache) && g_nresdirs < MAX_RES_DIRS) strcpy(g_resdirs[g_nresdirs++], cache);
+    }
+}
+// Reports access violations that happen while the early phase runs, wherever they are (module, offset, call stack).
+static volatile LONG g_earlyfaults;
+static const char *mod_of(void *a, char *buf, size_t cap, size_t *off) {
+    HMODULE m = NULL; buf[0] = 0; *off = 0;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)a, &m) && m) { char p[MAX_PATH]; GetModuleFileNameA(m, p, MAX_PATH); const char *s = strrchr(p, '\\'); snprintf(buf, cap, "%s", s ? s + 1 : p); *off = (size_t)((uint8_t *)a - (uint8_t *)m); }
+    return buf;
+}
+static LONG CALLBACK early_veh(EXCEPTION_POINTERS *ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION) return EXCEPTION_CONTINUE_SEARCH;
+    char mn[MAX_PATH]; size_t off; mod_of(ep->ExceptionRecord->ExceptionAddress, mn, sizeof mn, &off);
+    static void *lastaddr; if (ep->ExceptionRecord->ExceptionAddress == lastaddr || InterlockedIncrement(&g_earlyfaults) > 40) return EXCEPTION_CONTINUE_SEARCH;
+    lastaddr = ep->ExceptionRecord->ExceptionAddress;
+    clog("[Crash] access violation in %s+0x%llX, address 0x%llX, thread %lu", mn, (unsigned long long)off, (unsigned long long)(ep->ExceptionRecord->NumberParameters > 1 ? ep->ExceptionRecord->ExceptionInformation[1] : 0), GetCurrentThreadId());
+    void *bt[16]; USHORT n = RtlCaptureStackBackTrace(0, 16, bt, NULL);
+    for (USHORT i = 0; i < n; i++) { mod_of(bt[i], mn, sizeof mn, &off); clog("[Crash]   #%u %s+0x%llX", i, mn, (unsigned long long)off); }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+// Diagnostic (environment variable MEW_TRACE_LOAD=1): logs the first files the game reads through its packed-file loader (0x99FF50).
+typedef struct { char s[16]; size_t len, cap; } GStr;   // MSVC std::string layout (SSO buffer or heap pointer)
+typedef void *(__fastcall *LoadFn)(void *ctx, void *path, uint8_t useCache, uint8_t allowFallback);
+static LoadFn o_trace; static volatile LONG g_ntrace;
+static void *__fastcall h_trace(void *ctx, void *path, uint8_t uc, uint8_t af) {
+    if (InterlockedIncrement(&g_ntrace) <= 3000) { const char *s = (const char *)path; size_t len = *(size_t *)(s + 16), cap = *(size_t *)(s + 24); const char *p = cap > 15 ? *(const char **)s : s; if (len < 200) clog("[Trace] load %.*s (thread %lu)", (int)len, p, GetCurrentThreadId()); }
+    return o_trace(ctx, path, uc, af);
+}
+static void trace_loads(void) { void *next = chain_install(0x99FF50, h_trace, 100, "trace"); if (next) { o_trace = (LoadFn)next; clog("[Trace] packed-file load trace on"); } }
+// Process entry point: the earliest point where code can run synchronously without the loader lock. Community (Mewjector-style) mods are loaded
+// here because the game reads some of its data (furniture_info.data) before it parses its command line.
+typedef int (__fastcall *EntryFn)(void *);
+static EntryFn o_entry;
+static void early_community(void) {
+    if (InterlockedExchange(&g_early_done, 1)) return;
+    __try { mj_load_config(); if (g_mj.enabled) load_phases(1); } __except (EXCEPTION_EXECUTE_HANDLER) { clog("[ModLoader] early phase failed (0x%lX)", GetExceptionCode()); }
+    if (g_early_evt) SetEvent(g_early_evt);
+}
+static int __fastcall h_entry(void *peb) { clog("[ModLoader] entry point reached (thread %lu)", GetCurrentThreadId()); early_community(); clog("[ModLoader] early phase done"); return o_entry(peb); }
+static void __fastcall h_process_cmds(void *app, int argc, char **argv) {
+    __try {
+        early_community();
+        g_nresdirs = 0; if (g_cfg_resources) collect_resource_dirs();
+        int mp = -1;
+        for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "-modpaths")) { mp = i; break; }
+        char **add = (char **)calloc((size_t)g_nresdirs + 1, sizeof(char *)); int nadd = 0;
+        for (int d = 0; add && d < g_nresdirs; d++) {
+            int dup = 0;
+            for (int i = 1; i < argc; i++) if (i != mp && argv[i][0] != '-' && same_path(argv[i], g_resdirs[d])) dup = 1;
+            if (dup) { clog("[Resources] %s already passed on the command line", g_resdirs[d]); continue; }
+            add[nadd++] = _strdup(g_resdirs[d]);
+        }
+        if (nadd > 0) {
+            char **nv = (char **)calloc((size_t)argc + (size_t)nadd + 2, sizeof(char *)); int nc = 0;
+            if (nv) {
+                char *end = NULL; long count = -1;
+                if (mp >= 0 && mp + 1 < argc) { count = strtol(argv[mp + 1], &end, 0); if (!end || *end || end == argv[mp + 1]) count = -1; }
+                if (mp < 0) {
+                    for (int i = 0; i < argc; i++) nv[nc++] = argv[i];
+                    nv[nc++] = "-modpaths";
+                    for (int d = 0; d < nadd; d++) nv[nc++] = add[d];
+                } else if (count < 0) {
+                    for (int i = 0; i < argc; i++) nv[nc++] = argv[i];            // the group has no count: it runs to the end of the line
+                    for (int d = 0; d < nadd; d++) nv[nc++] = add[d];
+                } else {
+                    char *cnt = (char *)malloc(16); snprintf(cnt, 16, "%ld", count + nadd);
+                    int stop = mp + 2 + (int)count; if (stop > argc) stop = argc;
+                    for (int i = 0; i < mp + 1; i++) nv[nc++] = argv[i];
+                    nv[nc++] = cnt;
+                    for (int i = mp + 2; i < stop; i++) nv[nc++] = argv[i];
+                    for (int d = 0; d < nadd; d++) nv[nc++] = add[d];
+                    for (int i = stop; i < argc; i++) nv[nc++] = argv[i];
+                }
+                for (int d = 0; d < nadd; d++) clog("[Resources] overlay %s", add[d]);
+                argc = nc; argv = nv;
+            }
+        } else if (g_cfg_resources && g_nresdirs == 0) clog("[Resources] no resource folders in %s\\Mods", g_dir);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { clog("[Resources] argument rewrite failed (0x%lX), starting with the original arguments", GetExceptionCode()); }
+    o_process_cmds(app, argc, argv);
+}
+// Runs from DllMain, before the game's main(): the hook has to exist before ProcessCmds is called.
+static void early_init(void) {
+    IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)g_base; IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + dos->e_lfanew);
+    if (nt->FileHeader.TimeDateStamp != GAME_PE_TIMESTAMP) { if (g_early_evt) SetEvent(g_early_evt); return; }
+    load_cfg();
+    AddVectoredExceptionHandler(1, early_veh);
+    MH_STATUS st = MH_Initialize(); if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) { clog("[Resources] MinHook init failed: %s", MH_StatusToString(st)); if (g_early_evt) SetEvent(g_early_evt); return; }
+    void *tramp = NULL, *target = (void *)(g_base + RVA_PROCESS_CMDS);
+    st = MH_CreateHook(target, h_process_cmds, &tramp);
+    if (st == MH_OK) st = MH_EnableHook(target);
+    if (st != MH_OK) { clog("[Resources] ProcessCmds hook failed: %s", MH_StatusToString(st)); if (g_early_evt) SetEvent(g_early_evt); return; }
+    o_process_cmds = (ProcessCmdsFn)tramp;
+    clog("[Resources] ProcessCmds hook ready");
+    if (getenv("MEW_TRACE_LOAD")) trace_loads();
+    void *entry = (void *)(g_base + nt->OptionalHeader.AddressOfEntryPoint), *etramp = NULL;
+    st = g_cfg_entry ? MH_CreateHook(entry, h_entry, &etramp) : MH_ERROR_DISABLED; if (st == MH_OK) st = MH_EnableHook(entry);
+    if (st == MH_OK) { o_entry = (EntryFn)etramp; clog("[ModLoader] entry point hook ready (entry RVA 0x%X, thread %lu)", (unsigned)nt->OptionalHeader.AddressOfEntryPoint, GetCurrentThreadId()); }
+    else if (g_cfg_entry) clog("[ModLoader] entry point hook failed (%s), community mods load from ProcessCmds", MH_StatusToString(st));
+}
+
 // ---- mod loading ----
 typedef struct { const char *Id, *Name, *Version, *Description; } ModInfo;
 static void set_enabled(Mod *m, int on) {
@@ -364,33 +511,100 @@ static void set_enabled(Mod *m, int on) {
     if (fn) __try { fn(); } __except (EXCEPTION_EXECUTE_HANDLER) { clog("[ModLoader] %s %s threw", m->id, on ? "enable" : "disable"); }
     m->enabled = on; clog("[ModLoader] %s %s", m->id ? m->id : m->file, on ? "enabled" : "disabled");
 }
-static void load_mods(void) {
-    char pat[MAX_PATH], dir[MAX_PATH]; snprintf(dir, sizeof dir, "%s\\Mods", g_dir); CreateDirectoryA(dir, NULL);
-    snprintf(pat, sizeof pat, "%s\\config", dir); CreateDirectoryA(pat, NULL);
-    snprintf(pat, sizeof pat, "%s\\*.dll", dir);
-    WIN32_FIND_DATAA fd; HANDLE fh = FindFirstFileA(pat, &fd); if (fh == INVALID_HANDLE_VALUE) { clog("[ModLoader] no mods in %s", dir); return; }
-    do {
-        if (g_nmods >= MAX_MODS) break;
-        char path[MAX_PATH]; snprintf(path, sizeof path, "%s\\%s", dir, fd.cFileName);
-        HMODULE h = LoadLibraryA(path); if (!h) { clog("[ModLoader] %s: LoadLibrary failed (%lu)", fd.cFileName, GetLastError()); continue; }
-        void (*init)(MewgenicsApi *) = (void (*)(MewgenicsApi *))GetProcAddress(h, "MewMod_Init");
-        if (!init) { clog("[ModLoader] %s: missing MewMod_Init export, skipped", fd.cFileName); FreeLibrary(h); continue; }
-        Mod *m = &g_mods[g_nmods]; memset(m, 0, sizeof *m); m->h = h; strncpy(m->file, fd.cFileName, MAX_PATH - 1);
-        ModInfo *(*getinfo)(void) = (ModInfo *(*)(void))GetProcAddress(h, "MewMod_GetInfo");
-        ModInfo *info = NULL; if (getinfo) __try { info = getinfo(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
-        m->id = info && info->Id ? info->Id : m->file;
-        m->name = info && info->Name && *info->Name ? info->Name : m->id; m->version = info && info->Version ? info->Version : ""; m->description = info && info->Description ? info->Description : "";
-        m->enable = (void (*)(void))GetProcAddress(h, "MewMod_Enable"); m->disable = (void (*)(void))GetProcAddress(h, "MewMod_Disable"); m->reload = (void (*)(void))GetProcAddress(h, "MewMod_ConfigReload"); m->action = (void (*)(const char *))GetProcAddress(h, "MewMod_Action");
-        g_nmods++;
-        clog("[ModLoader] %s: %s %s", fd.cFileName, m->id, info && info->Version ? info->Version : "");
-        __try { init(&g_api); } __except (EXCEPTION_EXECUTE_HANDLER) { clog("[ModLoader] %s: MewMod_Init threw 0x%lX", m->id, GetExceptionCode()); continue; }
-        // Mods with AutoEnable enable themselves inside Init; InternalEnable/InternalDisable are idempotent.
-        if (is_disabled(m->id)) { m->enabled = 1; set_enabled(m, 0); }
-        else { m->enabled = 0; set_enabled(m, 1); }
-    } while (FindNextFileA(fh, &fd));
+// DLLs the community loader never touches (same list as Mewjector)
+static const char *g_exclude[] = { "version.dll", "steam_api.dll", "steam_api64.dll", "steamclient.dll", "steamclient64.dll", "tier0_s.dll", "tier0_s64.dll", "vstdlib_s.dll", "vstdlib_s64.dll",
+    "gameoverlayrenderer.dll", "gameoverlayrenderer64.dll", "d3dcompiler_47.dll", "xaudio2_9.dll", "xinput1_3.dll", "xinput1_4.dll", "xinput9_1_0.dll", NULL };
+static char g_seen[256][96]; static int g_nseen;
+// 1 when the DLL exports <name>, 0 when it does not, -1 when it cannot be read (its code is not run)
+static int dll_has_export(const char *path, const char *name) {
+    size_t n = 0; uint8_t *d = read_file(path, &n); int r = -1; if (!d) return -1;
+    if (n > 0x200 && d[0] == 'M' && d[1] == 'Z') {
+        uint32_t pe = *(uint32_t *)(d + 0x3c);
+        if (pe + 0x200 < n && *(uint32_t *)(d + pe) == 0x4550 && *(uint16_t *)(d + pe + 24) == 0x20b) {
+            uint16_t nsec = *(uint16_t *)(d + pe + 6), osz = *(uint16_t *)(d + pe + 20); uint32_t erva = *(uint32_t *)(d + pe + 24 + 112); size_t so = pe + 24 + osz;
+            #define RVA2OFF(rv, out) do { out = 0; for (int s_ = 0; s_ < nsec; s_++) { uint32_t vs = *(uint32_t *)(d + so + s_ * 40 + 8), va = *(uint32_t *)(d + so + s_ * 40 + 12), rs = *(uint32_t *)(d + so + s_ * 40 + 16), rp = *(uint32_t *)(d + so + s_ * 40 + 20); if ((rv) >= va && (rv) < va + (vs > rs ? vs : rs)) { out = (rv) - va + rp; break; } } } while (0)
+            r = 0; size_t eo; RVA2OFF(erva, eo);
+            if (erva && eo && eo + 40 < n) {
+                uint32_t cnt = *(uint32_t *)(d + eo + 24), nrva = *(uint32_t *)(d + eo + 32); size_t no; RVA2OFF(nrva, no);
+                for (uint32_t i = 0; no && i < cnt && no + 4 * i + 4 <= n; i++) { uint32_t sr = *(uint32_t *)(d + no + 4 * i); size_t so2; RVA2OFF(sr, so2); if (so2 && so2 < n && !strncmp((const char *)d + so2, name, strlen(name) + 1)) { r = 1; break; } }
+            }
+            #undef RVA2OFF
+        }
+    }
+    free(d); return r;
+}
+// early = 1: only DLLs that are not SDK mods (no MewMod_Init), loaded before the game reads its data; early = 0: everything else
+static void load_dll_locked(const char *path, const char *file);
+static void load_dll(const char *path, int early) {
+    const char *file = strrchr(path, '\\'); file = file ? file + 1 : path;
+    for (int i = 0; g_exclude[i]; i++) if (!_stricmp(file, g_exclude[i])) return;
+    if (early && dll_has_export(path, "MewMod_Init") != 0) return;
+    EnterCriticalSection(&g_loadcs); load_dll_locked(path, file); LeaveCriticalSection(&g_loadcs);
+}
+static void load_dll_locked(const char *path, const char *file) {
+    for (int i = 0; i < g_nseen; i++) if (!_stricmp(g_seen[i], file)) { clog("[ModLoader] %s already loaded, skipped (%s)", file, path); return; }
+    if (g_nseen < 256) { strncpy(g_seen[g_nseen], file, 95); g_seen[g_nseen][95] = 0; g_nseen++; }
+    if (g_nmods >= MAX_MODS) return;
+    HMODULE h = LoadLibraryA(path); if (!h) { clog("[ModLoader] %s: LoadLibrary failed (%lu)", file, GetLastError()); return; }
+    void (*init)(MewgenicsApi *) = (void (*)(MewgenicsApi *))GetProcAddress(h, "MewMod_Init");
+    if (!init) {
+        if (g_mj.enabled) clog("[ModLoader] %s: no MewMod_Init, kept loaded as a Mewjector-style mod", file);
+        else { clog("[ModLoader] %s: missing MewMod_Init export and community mods are disabled (chainloader.ini), unloaded", file); FreeLibrary(h); }
+        return;
+    }
+    Mod *m = &g_mods[g_nmods]; memset(m, 0, sizeof *m); m->h = h; strncpy(m->file, file, MAX_PATH - 1);
+    ModInfo *(*getinfo)(void) = (ModInfo *(*)(void))GetProcAddress(h, "MewMod_GetInfo");
+    ModInfo *info = NULL; if (getinfo) __try { info = getinfo(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    m->id = info && info->Id ? info->Id : m->file;
+    m->name = info && info->Name && *info->Name ? info->Name : m->id; m->version = info && info->Version ? info->Version : ""; m->description = info && info->Description ? info->Description : "";
+    m->enable = (void (*)(void))GetProcAddress(h, "MewMod_Enable"); m->disable = (void (*)(void))GetProcAddress(h, "MewMod_Disable"); m->reload = (void (*)(void))GetProcAddress(h, "MewMod_ConfigReload"); m->action = (void (*)(const char *))GetProcAddress(h, "MewMod_Action");
+    g_nmods++;
+    clog("[ModLoader] %s: %s %s", file, m->id, info && info->Version ? info->Version : "");
+    __try { init(&g_api); } __except (EXCEPTION_EXECUTE_HANDLER) { clog("[ModLoader] %s: MewMod_Init threw 0x%lX", m->id, GetExceptionCode()); return; }
+    // Mods with AutoEnable enable themselves inside Init; InternalEnable/InternalDisable are idempotent.
+    if (is_disabled(m->id)) { m->enabled = 1; set_enabled(m, 0); }
+    else { m->enabled = 0; set_enabled(m, 1); }
+}
+static void scan_dlls(const char *dir, int early) {
+    char pat[MAX_PATH]; snprintf(pat, sizeof pat, "%s\\*.dll", dir);
+    WIN32_FIND_DATAA fd; HANDLE fh = FindFirstFileA(pat, &fd); if (fh == INVALID_HANDLE_VALUE) return;
+    do { char path[MAX_PATH]; snprintf(path, sizeof path, "%s\\%s", dir, fd.cFileName); load_dll(path, early); } while (FindNextFileA(fh, &fd));
     FindClose(fh);
 }
-
+// Load order (same phases as Mewjector): [LoadOrder] entries, the scan folders (our Mods folder, then ScanPath and optionally the
+// game folder), then the DLLs listed in the Mewtator manifest. DLLs with MewMod_Init are SDK mods, the others are Mewjector-style mods.
+static void load_phases(int early) {
+    mj_load_config();
+    char dir[MAX_PATH], tmp[MAX_PATH]; snprintf(dir, sizeof dir, "%s\\Mods", g_dir); CreateDirectoryA(dir, NULL);
+    snprintf(tmp, sizeof tmp, "%s\\config", dir); CreateDirectoryA(tmp, NULL);
+    for (int i = 0; i < g_mj.norder && g_mj.enabled; i++) {
+        char p[MAX_PATH]; mj_resolve(g_mj.order[i], p, sizeof p);
+        if (GetFileAttributesA(p) == INVALID_FILE_ATTRIBUTES) { snprintf(tmp, sizeof tmp, "%s\\%s", dir, g_mj.order[i]); if (GetFileAttributesA(tmp) != INVALID_FILE_ATTRIBUTES) strcpy(p, tmp); else { if (early) clog("[ModLoader] LoadOrder %s: not installed", g_mj.order[i]); continue; } }
+        load_dll(p, early);
+    }
+    scan_dlls(dir, early);
+    if (g_mj.enabled) {
+        char sp[MAX_PATH]; mj_resolve(g_mj.scan_path, sp, sizeof sp);
+        if (!same_path(sp, dir)) scan_dlls(sp, early);
+        if (g_mj.scan_game_dir) scan_dlls(g_dir, early);
+        if (g_mj.manifest[0]) {
+            char mp[MAX_PATH]; mj_resolve(g_mj.manifest, mp, sizeof mp); FILE *f = fopen(mp, "r");
+            if (!f) clog("[ModLoader] Mewtator manifest %s not found", mp);
+            else {
+                char line[MAX_PATH]; int n = 0;
+                while (fgets(line, sizeof line, f)) { mj_trim(line); size_t l = strlen(line); if (!l || line[0] == '#') continue; if (l < 5 || _stricmp(line + l - 4, ".dll")) continue; if (GetFileAttributesA(line) == INVALID_FILE_ATTRIBUTES) { clog("[ModLoader] manifest: %s not found", line); continue; } load_dll(line, early); n++; }
+                fclose(f); clog("[ModLoader] Mewtator manifest %s: %d DLLs", mp, n);
+            }
+        }
+    }
+    if (!early && g_nmods == 0 && g_nseen == 0) clog("[ModLoader] no mods in %s", dir);
+}
+// SDK mods and everything not loaded early. Waits for the early phase (started from the ProcessCmds hook) to finish first.
+static void load_mods(void) {
+    if (g_early_evt) WaitForSingleObject(g_early_evt, 20000);
+    if (!g_early_done) { clog("[ModLoader] early phase did not run, loading community mods now"); load_phases(1); }
+    load_phases(0);
+}
 #include "menu.c"
 
 // ---- dev console extensions: mods / enable / disable / cmd / menu ----
@@ -409,7 +623,7 @@ static int core_console(SOCKET s, char *line) {
         for (int i = 0; i < g_ncmds; i++) if (!strcmp(g_cmds[i].name, tok[0])) { __try { g_cmds[i].fn(tok + 1, nt - 1); } __except (EXCEPTION_EXECUTE_HANDLER) {} sendstr(s, "ok"); return 1; }
         sendstr(s, "err no such command"); return 1;
     }
-    if (!strcmp(line, "core")) { snprintf(out, sizeof out, "ok MewCore %s hooks=%d mods=%d tc=%llx", CORE_VERSION, g_nhooks, g_nmods, (unsigned long long)g_turnControl); sendstr(s, out); return 1; }
+    if (!strcmp(line, "core")) { snprintf(out, sizeof out, "ok MewCore %s hooks=%d mods=%d tc=%llx", CORE_VERSION, chain_count(), g_nmods, (unsigned long long)g_turnControl); sendstr(s, out); return 1; }
     return 0;
 }
 
@@ -433,6 +647,8 @@ static LONG CALLBACK crash_veh(EXCEPTION_POINTERS *ep) {
 
 static DWORD WINAPI bootstrap(LPVOID p) {
     (void)p;
+    // MinHook suspends the other threads while it patches code: stay out of the way until the early phase (entry point hook) is done.
+    if (g_early_evt) WaitForSingleObject(g_early_evt, 30000);
     IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)g_base; IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + dos->e_lfanew);
     uint32_t ts = nt->FileHeader.TimeDateStamp;
     clog("[Bootstrap] MewCore %s, game base %llx, PE timestamp %08X%s", CORE_VERSION, (unsigned long long)g_base, ts, ts == GAME_PE_TIMESTAMP ? " (1.1.21239)" : " (UNSUPPORTED BUILD: hooks disabled)");
@@ -447,7 +663,7 @@ static DWORD WINAPI bootstrap(LPVOID p) {
     g_api.PatchBytes = api_patch; g_api.NopBytes = api_nop; g_api.RegisterMod = api_register_mod; g_api.RegisterFrameDrain = api_register_drain;
     g_api.CurrentTurnControlPtr = &g_turnControl; g_api.SuppressWarning = api_suppress_warning;
     load_mods();
-    clog("[Bootstrap] ready: %d hooks, %d mods", g_nhooks, g_nmods);
+    clog("[Bootstrap] ready: %d hooks, %d mods", chain_count(), g_nmods);
     return 0;
 }
 
@@ -460,7 +676,8 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
         g_self = h; g_base = (uint64_t)GetModuleHandleA(NULL);
         GetModuleFileNameA(h, g_dir, MAX_PATH); char *sl = strrchr(g_dir, '\\'); if (sl) *sl = 0;
         char lp[MAX_PATH]; snprintf(lp, sizeof lp, "%s\\mods_debug.log", g_dir); g_corelog = fopen(lp, "w");
-        InitializeCriticalSection(&g_cs);
+        InitializeCriticalSection(&g_cs); InitializeCriticalSection(&g_loadcs); g_early_evt = CreateEventA(NULL, TRUE, FALSE, NULL);
+        early_init();
         CreateThread(NULL, 0, bootstrap, NULL, 0, NULL);
     }
     return TRUE;
